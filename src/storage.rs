@@ -178,7 +178,7 @@ fn upsert_note(tx: &Transaction<'_>, note: &Note) -> Result<i64, StorageError> {
                     frontmatter_json,
                     note.parsed.body_text,
                     note.parsed.stats.word_count as i64,
-                    note.parsed.stats.line_count as i64,
+                    count_lines(&note.parsed.body_text) as i64,
                     note_id
                 ],
             )?;
@@ -205,7 +205,7 @@ fn upsert_note(tx: &Transaction<'_>, note: &Note) -> Result<i64, StorageError> {
                     frontmatter_json,
                     note.parsed.body_text,
                     note.parsed.stats.word_count as i64,
-                    note.parsed.stats.line_count as i64
+                    count_lines(&note.parsed.body_text) as i64
                 ],
             )?;
             Ok(tx.last_insert_rowid())
@@ -232,6 +232,29 @@ fn current_unix_timestamp() -> Result<i64, StorageError> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
 }
 
+fn count_lines(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        let newline_count = text.chars().filter(|ch| *ch == '\n').count();
+        if text.ends_with('\n') {
+            newline_count
+        } else {
+            newline_count + 1
+        }
+    }
+}
+
+fn body_line_offset(note: &ParsedNote) -> usize {
+    note.frontmatter
+        .as_ref()
+        .map_or(0, |frontmatter| frontmatter.line_end)
+}
+
+fn to_body_line(raw_line: usize, body_line_offset: usize) -> usize {
+    raw_line.saturating_sub(body_line_offset)
+}
+
 /// Read a file modification time as Unix seconds when the filesystem exposes it.
 ///
 /// This is best-effort because `mtime` is optional storage metadata. Missing metadata should not
@@ -249,6 +272,7 @@ fn replace_headings(
     note_id: i64,
     note: &ParsedNote,
 ) -> Result<(), StorageError> {
+    let body_line_offset = body_line_offset(note);
     let mut statement = tx.prepare(
         "INSERT INTO note_headings (
             note_id,
@@ -269,8 +293,8 @@ fn replace_headings(
             i64::from(heading.level),
             heading.text,
             heading.normalized_text,
-            heading.start_line as i64,
-            heading.end_line as i64
+            to_body_line(heading.start_line, body_line_offset) as i64,
+            to_body_line(heading.end_line, body_line_offset) as i64
         ])?;
     }
 
@@ -282,6 +306,7 @@ fn replace_links(
     note_id: i64,
     note: &ParsedNote,
 ) -> Result<(), StorageError> {
+    let body_line_offset = body_line_offset(note);
     let mut statement = tx.prepare(
         "INSERT INTO links (
             note_id,
@@ -304,7 +329,7 @@ fn replace_links(
             link.target_heading,
             link.alias,
             if link.is_embed { 1_i64 } else { 0_i64 },
-            link.line as i64,
+            to_body_line(link.line, body_line_offset) as i64,
             link.byte_start as i64,
             link.byte_end as i64
         ])?;
@@ -314,6 +339,7 @@ fn replace_links(
 }
 
 fn replace_tags(tx: &Transaction<'_>, note_id: i64, note: &ParsedNote) -> Result<(), StorageError> {
+    let body_line_offset = body_line_offset(note);
     let mut statement = tx.prepare(
         "INSERT INTO tags (
             note_id,
@@ -335,7 +361,8 @@ fn replace_tags(tx: &Transaction<'_>, note_id: i64, note: &ParsedNote) -> Result
             tag.raw,
             tag.normalized,
             source,
-            tag.line.map(|line| line as i64)
+            tag.line
+                .map(|line| to_body_line(line, body_line_offset) as i64)
         ])?;
     }
 
@@ -369,7 +396,7 @@ See [[CAP]] and #distributed
         let expected_content_hash = blake3::hash(note.raw_text.as_bytes()).to_hex().to_string();
         let expected_body_text = note.body_text.clone();
         let expected_word_count = note.stats.word_count as i64;
-        let expected_line_count = note.stats.line_count as i64;
+        let expected_line_count = super::count_lines(&note.body_text) as i64;
 
         let note_id = persist_note(
             &mut conn,
@@ -437,6 +464,84 @@ See [[CAP]] and #distributed
         assert_eq!(heading_count, 1);
         assert_eq!(link_count, 1);
         assert_eq!(tag_count, 2);
+    }
+
+    #[test]
+    fn persist_note_stores_body_relative_positions() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&conn).expect("initialize schema");
+
+        let note = parse_note_str(
+            r#"---
+tags:
+  - systems
+---
+# Distributed Systems
+
+See [[CAP]] and #distributed
+"#,
+        );
+
+        let note_id = persist_note(
+            &mut conn,
+            &Note::new(
+                note,
+                NoteMetadata {
+                    path: "systems/distributed.md".to_string(),
+                    mtime: None,
+                },
+            ),
+        )
+        .expect("persist note");
+
+        let stored_note: (String, i64) = conn
+            .query_row(
+                "SELECT content, line_count FROM notes WHERE id = ?1",
+                params![note_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load stored note");
+        let stored_heading: (i64, i64) = conn
+            .query_row(
+                "SELECT start_line, end_line FROM note_headings WHERE note_id = ?1",
+                params![note_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load stored heading");
+        let stored_link_line: i64 = conn
+            .query_row(
+                "SELECT line FROM links WHERE note_id = ?1",
+                params![note_id],
+                |row| row.get(0),
+            )
+            .expect("load stored link line");
+        let stored_tags: Vec<(String, Option<i64>)> = {
+            let mut statement = conn
+                .prepare("SELECT normalized, line FROM tags WHERE note_id = ?1 ORDER BY id")
+                .expect("prepare tags query");
+            statement
+                .query_map(params![note_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query tags")
+                .collect::<rusqlite::Result<Vec<(String, Option<i64>)>>>()
+                .expect("collect tags")
+        };
+
+        assert_eq!(
+            stored_note,
+            (
+                "# Distributed Systems\n\nSee [[CAP]] and #distributed\n".to_string(),
+                3
+            )
+        );
+        assert_eq!(stored_heading, (1, 3));
+        assert_eq!(stored_link_line, 3);
+        assert_eq!(
+            stored_tags,
+            vec![
+                ("#distributed".to_string(), Some(3)),
+                ("#systems".to_string(), None),
+            ]
+        );
     }
 
     #[test]
