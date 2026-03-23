@@ -27,16 +27,17 @@ CREATE INDEX IF NOT EXISTS idx_note_headings_note_id
     ON note_headings(note_id);
 
 CREATE TABLE IF NOT EXISTS links (
-    id             INTEGER PRIMARY KEY,
-    note_id        INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-    raw            TEXT NOT NULL,
-    target_note    TEXT NOT NULL,
-    target_heading TEXT,
-    alias          TEXT,
-    is_embed       INTEGER NOT NULL,
-    line           INTEGER NOT NULL,
-    byte_start     INTEGER NOT NULL,
-    byte_end       INTEGER NOT NULL
+    id               INTEGER PRIMARY KEY,
+    note_id          INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    raw              TEXT NOT NULL,
+    target_note      TEXT NOT NULL,
+    target_note_path TEXT,
+    target_heading   TEXT,
+    alias            TEXT,
+    is_embed         INTEGER NOT NULL,
+    line             INTEGER NOT NULL,
+    byte_start       INTEGER NOT NULL,
+    byte_end         INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_links_note_id
@@ -44,6 +45,9 @@ CREATE INDEX IF NOT EXISTS idx_links_note_id
 
 CREATE INDEX IF NOT EXISTS idx_links_target_note
     ON links(target_note);
+
+CREATE INDEX IF NOT EXISTS idx_links_target_note_path
+    ON links(target_note_path);
 
 CREATE TABLE IF NOT EXISTS tags (
     id         INTEGER PRIMARY KEY,
