@@ -80,13 +80,16 @@ Examples to avoid:
 - Use `insta` snapshots for structured parser output when they provide meaningful regression coverage.
 - Keep targeted assertions for fragile values that should not be over-snapshotted, such as third-party error strings.
 - Do not claim verification unless `cargo test` or an equivalent command was actually run.
+- Keep local validation aligned with CI checks when changing workspace metadata or tool configs.
 
 ## Current Validation Baseline
 
-Before finishing parser changes, run:
+Before finishing changes that affect parser code, workspace metadata, or CI, run:
 
 ```bash
+taplo fmt --check --diff
 cargo fmt
 cargo test
 cargo clippy --all -- -D warnings
+cargo deny check --all-features
 ```
