@@ -1,5 +1,4 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use std::collections::HashSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -140,33 +139,6 @@ pub fn persist_note(conn: &mut Connection, note: &Note) -> Result<i64, StorageEr
     Ok(note_id)
 }
 
-/// Delete note rows whose logical paths are no longer present in the current vault scan.
-///
-/// This keeps the database consistent after files are deleted or moved in the vault. Child rows
-/// disappear automatically because the schema uses `ON DELETE CASCADE`.
-// This helper is consumed by the later indexer stack layer.
-// Keep it local here so storage semantics land before vault orchestration.
-#[allow(dead_code)]
-pub(crate) fn delete_notes_not_in_paths(
-    conn: &Connection,
-    live_paths: &HashSet<String>,
-) -> Result<usize, StorageError> {
-    let mut statement = conn.prepare("SELECT path FROM notes ORDER BY path")?;
-    let stored_paths = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
-
-    let mut deleted_count = 0;
-    for path in stored_paths {
-        if live_paths.contains(&path) {
-            continue;
-        }
-
-        deleted_count += conn.execute("DELETE FROM notes WHERE path = ?1", params![path])?;
-    }
-
-    Ok(deleted_count)
-}
 fn upsert_note(tx: &Transaction<'_>, note: &Note) -> Result<i64, StorageError> {
     let frontmatter_json = note
         .parsed
