@@ -116,6 +116,17 @@ impl Note {
     }
 }
 
+/// Result of resolving one parsed link target against the stored note set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTargetResolution {
+    /// The target resolved to one stored note path.
+    Resolved(String),
+    /// No stored note matched the target.
+    Missing,
+    /// More than one stored note matched the target suffix.
+    Ambiguous(Vec<String>),
+}
+
 /// Create the current schema in an existing SQLite connection.
 ///
 /// The schema is intentionally small and local to the current Phase 1 note-level index.
@@ -137,6 +148,112 @@ pub fn persist_note(conn: &mut Connection, note: &Note) -> Result<i64, StorageEr
     replace_tags(&tx, note_id, &note.parsed)?;
     tx.commit()?;
     Ok(note_id)
+}
+
+/// Resolve one parsed note target to a stored note path using Obsidian-style suffix rules.
+///
+/// Exact full-path matches win first. If there is no exact path match, the shortest unique suffix
+/// rule is applied over the stored note paths, and ambiguous matches are reported explicitly.
+pub fn resolve_target_note_path(
+    conn: &Connection,
+    source_path: &str,
+    target_note: &str,
+) -> Result<LinkTargetResolution, StorageError> {
+    let note_paths = load_note_paths(conn)?;
+    Ok(resolve_target_note_path_in_paths(
+        &note_paths,
+        source_path,
+        target_note,
+    ))
+}
+
+/// Refresh the cached resolved path for every stored link.
+///
+/// This runs after note rows are up to date so queries can join on `links.target_note_path`
+/// directly instead of re-running vault-wide resolution every time.
+pub fn refresh_resolved_link_targets(conn: &mut Connection) -> Result<(), StorageError> {
+    let note_paths = load_note_paths(conn)?;
+    let links = load_links_for_resolution(conn)?;
+
+    let tx = conn.transaction()?;
+    let mut statement = tx.prepare("UPDATE links SET target_note_path = ?1 WHERE id = ?2")?;
+
+    for (link_id, source_path, target_note) in links {
+        let resolved_path =
+            match resolve_target_note_path_in_paths(&note_paths, &source_path, &target_note) {
+                LinkTargetResolution::Resolved(path) => Some(path),
+                LinkTargetResolution::Missing | LinkTargetResolution::Ambiguous(_) => None,
+            };
+
+        statement.execute(params![resolved_path, link_id])?;
+    }
+
+    drop(statement);
+    tx.commit()?;
+    Ok(())
+}
+
+fn load_note_paths(conn: &Connection) -> Result<Vec<String>, StorageError> {
+    let mut statement = conn.prepare("SELECT path FROM notes ORDER BY path")?;
+    Ok(statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?)
+}
+
+fn load_links_for_resolution(
+    conn: &Connection,
+) -> Result<Vec<(i64, String, String)>, StorageError> {
+    let mut statement = conn.prepare(
+        "SELECT links.id, notes.path, links.target_note
+         FROM links
+         INNER JOIN notes ON notes.id = links.note_id
+         ORDER BY links.id",
+    )?;
+
+    Ok(statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<(i64, String, String)>>>()?)
+}
+
+fn resolve_target_note_path_in_paths(
+    note_paths: &[String],
+    source_path: &str,
+    target_note: &str,
+) -> LinkTargetResolution {
+    if target_note.is_empty() {
+        return LinkTargetResolution::Resolved(source_path.to_string());
+    }
+
+    let normalized_target = strip_markdown_suffix(target_note);
+    let exact_match = note_paths
+        .iter()
+        .find(|path| strip_markdown_suffix(path) == normalized_target);
+    if let Some(path) = exact_match {
+        return LinkTargetResolution::Resolved(path.clone());
+    }
+
+    let suffix_matches = note_paths
+        .iter()
+        .filter(|path| path_matches_note_suffix(path, normalized_target))
+        .cloned()
+        .collect::<Vec<String>>();
+
+    match suffix_matches.len() {
+        0 => LinkTargetResolution::Missing,
+        1 => LinkTargetResolution::Resolved(suffix_matches[0].clone()),
+        _ => LinkTargetResolution::Ambiguous(suffix_matches),
+    }
+}
+
+fn path_matches_note_suffix(note_path: &str, target_note: &str) -> bool {
+    let normalized_path = strip_markdown_suffix(note_path);
+    normalized_path
+        .strip_suffix(target_note)
+        .is_some_and(|prefix| prefix.ends_with('/'))
+}
+
+fn strip_markdown_suffix(path: &str) -> &str {
+    path.strip_suffix(".md").unwrap_or(path)
 }
 
 fn upsert_note(tx: &Transaction<'_>, note: &Note) -> Result<i64, StorageError> {
@@ -312,13 +429,14 @@ fn replace_links(
             note_id,
             raw,
             target_note,
+            target_note_path,
             target_heading,
             alias,
             is_embed,
             line,
             byte_start,
             byte_end
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
 
     for link in &note.links {
@@ -326,6 +444,7 @@ fn replace_links(
             note_id,
             link.raw,
             link.target_note,
+            Option::<String>::None,
             link.target_heading,
             link.alias,
             if link.is_embed { 1_i64 } else { 0_i64 },
@@ -376,7 +495,10 @@ mod tests {
 
     use crate::parser::parse_note_str;
 
-    use super::{Note, NoteMetadata, initialize_schema, persist_note};
+    use super::{
+        LinkTargetResolution, Note, NoteMetadata, initialize_schema, persist_note,
+        refresh_resolved_link_targets, resolve_target_note_path,
+    };
 
     #[test]
     fn persists_parsed_note_into_all_tables() {
@@ -690,6 +812,132 @@ See [[CAP]] and #distributed
         );
         assert_ne!(original_hash, updated_hash);
         assert!(updated_index_at >= original_index_at);
+    }
+
+    #[test]
+    fn resolve_target_note_path_prefers_exact_path_over_longer_suffix() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&conn).expect("initialize schema");
+
+        for path in ["A/B/Note.md", "X/A/B/Note.md"] {
+            persist_note(
+                &mut conn,
+                &Note::new(
+                    parse_note_str("# Note\n"),
+                    NoteMetadata {
+                        path: path.to_string(),
+                        mtime: None,
+                    },
+                ),
+            )
+            .expect("persist note");
+        }
+
+        let resolution =
+            resolve_target_note_path(&conn, "Source.md", "A/B/Note").expect("resolve target");
+
+        assert_eq!(
+            resolution,
+            LinkTargetResolution::Resolved("A/B/Note.md".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_note_path_supports_unique_suffix_and_reports_ambiguity() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&conn).expect("initialize schema");
+
+        for path in ["A/B/Note.md", "A/C/Note.md", "D/B/Note.md"] {
+            persist_note(
+                &mut conn,
+                &Note::new(
+                    parse_note_str("# Note\n"),
+                    NoteMetadata {
+                        path: path.to_string(),
+                        mtime: None,
+                    },
+                ),
+            )
+            .expect("persist note");
+        }
+
+        let unique =
+            resolve_target_note_path(&conn, "Source.md", "C/Note").expect("resolve unique suffix");
+        let ambiguous =
+            resolve_target_note_path(&conn, "Source.md", "B/Note").expect("resolve ambiguity");
+
+        assert_eq!(
+            unique,
+            LinkTargetResolution::Resolved("A/C/Note.md".to_string())
+        );
+        assert_eq!(
+            ambiguous,
+            LinkTargetResolution::Ambiguous(vec![
+                "A/B/Note.md".to_string(),
+                "D/B/Note.md".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn refresh_resolved_link_targets_populates_cached_target_paths() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&conn).expect("initialize schema");
+
+        persist_note(
+            &mut conn,
+            &Note::new(
+                parse_note_str(
+                    "See [[A/B/Note]], [[C/Note]], [[B/Note]], and [[#Local Heading]]\n",
+                ),
+                NoteMetadata {
+                    path: "Source.md".to_string(),
+                    mtime: None,
+                },
+            ),
+        )
+        .expect("persist source note");
+
+        for path in ["A/B/Note.md", "A/C/Note.md", "D/B/Note.md"] {
+            persist_note(
+                &mut conn,
+                &Note::new(
+                    parse_note_str("# Note\n"),
+                    NoteMetadata {
+                        path: path.to_string(),
+                        mtime: None,
+                    },
+                ),
+            )
+            .expect("persist note");
+        }
+
+        refresh_resolved_link_targets(&mut conn).expect("refresh resolved targets");
+
+        let stored_targets: Vec<(String, Option<String>)> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT target_note, target_note_path
+                     FROM links
+                     ORDER BY id",
+                )
+                .expect("prepare targets query");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query targets")
+                .collect::<rusqlite::Result<Vec<(String, Option<String>)>>>()
+                .expect("collect targets")
+        };
+
+        assert_eq!(
+            stored_targets,
+            vec![
+                ("A/B/Note".to_string(), Some("A/B/Note.md".to_string())),
+                ("C/Note".to_string(), Some("A/C/Note.md".to_string())),
+                ("B/Note".to_string(), None),
+                ("".to_string(), Some("Source.md".to_string())),
+            ]
+        );
     }
 
     #[test]
