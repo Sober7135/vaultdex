@@ -1,11 +1,10 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::storage::{
-    Note, StorageError, delete_notes_not_in_paths, initialize_schema, persist_note,
-    refresh_resolved_link_targets,
+    Note, StorageError, initialize_schema, persist_note, refresh_resolved_link_targets,
 };
 
 /// Fatal vault indexing error.
@@ -114,6 +113,31 @@ pub fn index_vault(
     report.deleted_notes = delete_notes_not_in_paths(conn, &live_paths)?;
     refresh_resolved_link_targets(conn)?;
     Ok(report)
+}
+
+/// Delete note rows whose logical paths are no longer present in the current vault scan.
+///
+/// This stays in the indexer layer because it is only needed during vault-wide orchestration.
+/// The storage layer still owns the schema semantics through `ON DELETE CASCADE`.
+fn delete_notes_not_in_paths(
+    conn: &Connection,
+    live_paths: &HashSet<String>,
+) -> Result<usize, StorageError> {
+    let mut statement = conn.prepare("SELECT path FROM notes ORDER BY path")?;
+    let stored_paths = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+
+    let mut deleted_count = 0;
+    for path in stored_paths {
+        if live_paths.contains(&path) {
+            continue;
+        }
+
+        deleted_count += conn.execute("DELETE FROM notes WHERE path = ?1", params![path])?;
+    }
+
+    Ok(deleted_count)
 }
 
 fn collect_markdown_files(vault_root: &Path) -> Result<Vec<PathBuf>, IndexError> {
