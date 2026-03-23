@@ -144,6 +144,9 @@ pub fn persist_note(conn: &mut Connection, note: &Note) -> Result<i64, StorageEr
 ///
 /// This keeps the database consistent after files are deleted or moved in the vault. Child rows
 /// disappear automatically because the schema uses `ON DELETE CASCADE`.
+// This helper is consumed by the later indexer stack layer.
+// Keep it local here so storage semantics land before vault orchestration.
+#[allow(dead_code)]
 pub(crate) fn delete_notes_not_in_paths(
     conn: &Connection,
     live_paths: &HashSet<String>,
