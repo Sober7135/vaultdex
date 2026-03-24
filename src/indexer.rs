@@ -89,6 +89,7 @@ pub fn index_vault(
         deleted_notes: 0,
         failed_files: Vec::new(),
     };
+    let tx = conn.transaction().map_err(StorageError::from)?;
 
     for file_path in markdown_files {
         let vault_relative_path = vault_relative_path(vault_root, &file_path)?;
@@ -98,7 +99,7 @@ pub fn index_vault(
 
         match Note::from_source_and_vault_path(&file_path, &vault_relative_path) {
             Ok(note) => {
-                persist_note(conn, &note)?;
+                persist_note(&tx, &note)?;
                 report.indexed_files += 1;
             }
             Err(err) => {
@@ -110,8 +111,9 @@ pub fn index_vault(
         }
     }
 
-    report.deleted_notes = delete_notes_not_in_paths(conn, &live_paths)?;
-    refresh_resolved_link_targets(conn)?;
+    report.deleted_notes = delete_notes_not_in_paths(&tx, &live_paths)?;
+    refresh_resolved_link_targets(&tx)?;
+    tx.commit().map_err(StorageError::from)?;
     Ok(report)
 }
 
@@ -120,10 +122,10 @@ pub fn index_vault(
 /// This stays in the indexer layer because it is only needed during vault-wide orchestration.
 /// The storage layer still owns the schema semantics through `ON DELETE CASCADE`.
 fn delete_notes_not_in_paths(
-    conn: &Connection,
+    tx: &rusqlite::Transaction<'_>,
     live_paths: &HashSet<String>,
 ) -> Result<usize, StorageError> {
-    let mut statement = conn.prepare("SELECT path FROM notes ORDER BY path")?;
+    let mut statement = tx.prepare("SELECT path FROM notes ORDER BY path")?;
     let stored_paths = statement
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<String>>>()?;
@@ -134,7 +136,7 @@ fn delete_notes_not_in_paths(
             continue;
         }
 
-        deleted_count += conn.execute("DELETE FROM notes WHERE path = ?1", params![path])?;
+        deleted_count += tx.execute("DELETE FROM notes WHERE path = ?1", params![path])?;
     }
 
     Ok(deleted_count)
