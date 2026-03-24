@@ -167,9 +167,9 @@ fn upsert_note(tx: &Transaction<'_>, note: &Note) -> Result<i64, StorageError> {
                      content_hash = ?2,
                      index_at = ?3,
                      frontmatter_json = ?4,
-                     content = ?5,
-                     word_count = ?6,
-                     line_count = ?7
+                     body_text = ?5,
+                     body_word_count = ?6,
+                     body_line_count = ?7
                  WHERE id = ?8",
                 params![
                     note.metadata.mtime,
@@ -193,9 +193,9 @@ fn upsert_note(tx: &Transaction<'_>, note: &Note) -> Result<i64, StorageError> {
                     content_hash,
                     index_at,
                     frontmatter_json,
-                    content,
-                    word_count,
-                    line_count
+                    body_text,
+                    body_word_count,
+                    body_line_count
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     note.metadata.path,
@@ -412,7 +412,7 @@ See [[CAP]] and #distributed
 
         let stored_note: (String, Option<i64>, String, i64, Option<String>, String, i64, i64) = conn
             .query_row(
-                "SELECT path, mtime, content_hash, index_at, frontmatter_json, content, word_count, line_count
+                "SELECT path, mtime, content_hash, index_at, frontmatter_json, body_text, body_word_count, body_line_count
                  FROM notes WHERE id = ?1",
                 params![note_id],
                 |row| {
@@ -496,7 +496,7 @@ See [[CAP]] and #distributed
 
         let stored_note: (String, i64) = conn
             .query_row(
-                "SELECT content, line_count FROM notes WHERE id = ?1",
+                "SELECT body_text, body_line_count FROM notes WHERE id = ?1",
                 params![note_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )

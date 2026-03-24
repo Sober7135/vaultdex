@@ -7,9 +7,9 @@ CREATE TABLE IF NOT EXISTS notes (
     content_hash     TEXT NOT NULL,
     index_at         INTEGER NOT NULL,
     frontmatter_json TEXT,
-    content          TEXT NOT NULL,
-    word_count       INTEGER NOT NULL,
-    line_count       INTEGER NOT NULL
+    body_text        TEXT NOT NULL,
+    body_word_count  INTEGER NOT NULL,
+    body_line_count  INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS note_headings (
