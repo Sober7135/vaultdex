@@ -136,17 +136,15 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Upsert one storage note and rebuild its child rows inside a single transaction.
+/// Upsert one storage note and rebuild its child rows within the caller's transaction.
 ///
-/// This treats `NoteMetadata.path` as the stable note identity. On update, the note row is kept
-/// and all headings, links, and tags for that note are deleted and re-inserted from scratch.
-pub fn persist_note(conn: &mut Connection, note: &Note) -> Result<i64, StorageError> {
-    let tx = conn.transaction()?;
-    let note_id = upsert_note(&tx, note)?;
-    replace_headings(&tx, note_id, &note.parsed)?;
-    replace_links(&tx, note_id, &note.parsed)?;
-    replace_tags(&tx, note_id, &note.parsed)?;
-    tx.commit()?;
+/// This lets higher-level orchestration choose the transaction boundary. On update, the note row
+/// is kept and all headings, links, and tags for that note are deleted and re-inserted from scratch.
+pub fn persist_note(tx: &Transaction<'_>, note: &Note) -> Result<i64, StorageError> {
+    let note_id = upsert_note(tx, note)?;
+    replace_headings(tx, note_id, &note.parsed)?;
+    replace_links(tx, note_id, &note.parsed)?;
+    replace_tags(tx, note_id, &note.parsed)?;
     Ok(note_id)
 }
 
@@ -167,15 +165,13 @@ pub fn resolve_target_note_path(
     ))
 }
 
-/// Refresh the cached resolved path for every stored link.
+/// Refresh the cached resolved path for every stored link within the caller's transaction.
 ///
 /// This runs after note rows are up to date so queries can join on `links.target_note_path`
 /// directly instead of re-running vault-wide resolution every time.
-pub fn refresh_resolved_link_targets(conn: &mut Connection) -> Result<(), StorageError> {
-    let note_paths = load_note_paths(conn)?;
-    let links = load_links_for_resolution(conn)?;
-
-    let tx = conn.transaction()?;
+pub fn refresh_resolved_link_targets(tx: &Transaction<'_>) -> Result<(), StorageError> {
+    let note_paths = load_note_paths(tx)?;
+    let links = load_links_for_resolution(tx)?;
     let mut statement = tx.prepare("UPDATE links SET target_note_path = ?1 WHERE id = ?2")?;
 
     for (link_id, source_path, target_note) in links {
@@ -189,7 +185,6 @@ pub fn refresh_resolved_link_targets(conn: &mut Connection) -> Result<(), Storag
     }
 
     drop(statement);
-    tx.commit()?;
     Ok(())
 }
 
@@ -500,6 +495,19 @@ mod tests {
         refresh_resolved_link_targets, resolve_target_note_path,
     };
 
+    fn persist_note_committed(conn: &mut Connection, note: &Note) -> i64 {
+        let tx = conn.transaction().expect("begin transaction");
+        let note_id = persist_note(&tx, note).expect("persist note");
+        tx.commit().expect("commit transaction");
+        note_id
+    }
+
+    fn refresh_resolved_link_targets_committed(conn: &mut Connection) {
+        let tx = conn.transaction().expect("begin transaction");
+        refresh_resolved_link_targets(&tx).expect("refresh resolved targets");
+        tx.commit().expect("commit transaction");
+    }
+
     #[test]
     fn persists_parsed_note_into_all_tables() {
         let mut conn = Connection::open_in_memory().expect("open in-memory sqlite");
@@ -520,7 +528,7 @@ See [[CAP]] and #distributed
         let expected_word_count = note.stats.word_count as i64;
         let expected_line_count = super::count_lines(&note.body_text) as i64;
 
-        let note_id = persist_note(
+        let note_id = persist_note_committed(
             &mut conn,
             &Note::new(
                 note,
@@ -529,8 +537,7 @@ See [[CAP]] and #distributed
                     mtime: Some(1_700_000_000),
                 },
             ),
-        )
-        .expect("persist note");
+        );
 
         let stored_note: (String, Option<i64>, String, i64, Option<String>, String, i64, i64) = conn
             .query_row(
@@ -604,7 +611,7 @@ See [[CAP]] and #distributed
 "#,
         );
 
-        let note_id = persist_note(
+        let note_id = persist_note_committed(
             &mut conn,
             &Note::new(
                 note,
@@ -613,8 +620,7 @@ See [[CAP]] and #distributed
                     mtime: None,
                 },
             ),
-        )
-        .expect("persist note");
+        );
 
         let stored_note: (String, i64) = conn
             .query_row(
@@ -680,7 +686,7 @@ See [[CAP]] and #distributed
             },
         );
 
-        let note_id = persist_note(&mut conn, &note).expect("persist note");
+        let note_id = persist_note_committed(&mut conn, &note);
         let stored: (String, Option<i64>) = conn
             .query_row(
                 "SELECT path, mtime FROM notes WHERE id = ?1",
@@ -717,8 +723,8 @@ See [[CAP]] and #distributed
             },
         );
 
-        let original_id = persist_note(&mut conn, &original_note).expect("persist original");
-        let updated_id = persist_note(&mut conn, &updated_note).expect("persist updated");
+        let original_id = persist_note_committed(&mut conn, &original_note);
+        let updated_id = persist_note_committed(&mut conn, &updated_note);
 
         assert_eq!(original_id, updated_id);
 
@@ -778,7 +784,7 @@ See [[CAP]] and #distributed
             },
         );
 
-        let note_id = persist_note(&mut conn, &original_note).expect("persist original");
+        let note_id = persist_note_committed(&mut conn, &original_note);
         let (original_hash, original_index_at): (String, i64) = conn
             .query_row(
                 "SELECT content_hash, index_at FROM notes WHERE id = ?1",
@@ -789,7 +795,7 @@ See [[CAP]] and #distributed
 
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        persist_note(&mut conn, &updated_note).expect("persist updated");
+        persist_note_committed(&mut conn, &updated_note);
         let (updated_hash, updated_index_at): (String, i64) = conn
             .query_row(
                 "SELECT content_hash, index_at FROM notes WHERE id = ?1",
@@ -820,7 +826,7 @@ See [[CAP]] and #distributed
         initialize_schema(&conn).expect("initialize schema");
 
         for path in ["A/B/Note.md", "X/A/B/Note.md"] {
-            persist_note(
+            persist_note_committed(
                 &mut conn,
                 &Note::new(
                     parse_note_str("# Note\n"),
@@ -829,8 +835,7 @@ See [[CAP]] and #distributed
                         mtime: None,
                     },
                 ),
-            )
-            .expect("persist note");
+            );
         }
 
         let resolution =
@@ -848,7 +853,7 @@ See [[CAP]] and #distributed
         initialize_schema(&conn).expect("initialize schema");
 
         for path in ["A/B/Note.md", "A/C/Note.md", "D/B/Note.md"] {
-            persist_note(
+            persist_note_committed(
                 &mut conn,
                 &Note::new(
                     parse_note_str("# Note\n"),
@@ -857,8 +862,7 @@ See [[CAP]] and #distributed
                         mtime: None,
                     },
                 ),
-            )
-            .expect("persist note");
+            );
         }
 
         let unique =
@@ -884,7 +888,7 @@ See [[CAP]] and #distributed
         let mut conn = Connection::open_in_memory().expect("open in-memory sqlite");
         initialize_schema(&conn).expect("initialize schema");
 
-        persist_note(
+        persist_note_committed(
             &mut conn,
             &Note::new(
                 parse_note_str(
@@ -895,11 +899,10 @@ See [[CAP]] and #distributed
                     mtime: None,
                 },
             ),
-        )
-        .expect("persist source note");
+        );
 
         for path in ["A/B/Note.md", "A/C/Note.md", "D/B/Note.md"] {
-            persist_note(
+            persist_note_committed(
                 &mut conn,
                 &Note::new(
                     parse_note_str("# Note\n"),
@@ -908,11 +911,10 @@ See [[CAP]] and #distributed
                         mtime: None,
                     },
                 ),
-            )
-            .expect("persist note");
+            );
         }
 
-        refresh_resolved_link_targets(&mut conn).expect("refresh resolved targets");
+        refresh_resolved_link_targets_committed(&mut conn);
 
         let stored_targets: Vec<(String, Option<String>)> = {
             let mut statement = conn
